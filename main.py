@@ -1,109 +1,130 @@
-import streamlit as st
-import requests
-from flask import Flask, request, jsonify
-from diffusers import StableDiffusionPipeline
+# app.py
+from flask import Flask, render_template, request, jsonify, send_file
 import torch
-from PIL import Image
+from diffusers import StableDiffusionPipeline
 import io
-import base64
-
-# --- Flask Backend (Embedded) ---
+from PIL import Image, ImageDraw, ImageFont
+import os
+import uuid
 
 app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'static/generated'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-try:
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
-    pipe = pipe.to("cuda")
-except Exception as e:
-    print(f"Error loading Diffusers model: {e}")
-    pipe = None
+# Global variable for the model
+pipe = None
 
-def generate_logos_from_api(company_name, style, colors, focus):
-    return [
-        f"https://placehold.co/150x100?text={company_name}+{style}+{focus}+1",
-        f"https://placehold.co/150x100?text={company_name}+{style}+{focus}+2",
-        f"https://placehold.co/150x100?text={company_name}+{style}+{focus}+3",
-    ]
-
-def generate_logo_with_diffusers(prompt):
+def load_model():
+    global pipe
     if pipe is None:
-        return None
-    try:
-        image = pipe(prompt).images[0]
-        buffered = io.BytesIO()
-        image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        return f'data:image/png;base64,{img_str}'
-    except Exception as e:
-        print(f"Diffusers error: {e}")
-        return None
-
-@app.route("/generate_logos", methods=["POST"])
-def generate_logos():
-    data = request.get_json()
-    company_name = data["company_name"]
-    company_focus = data["company_focus"]
-    style = data["style"]
-    colors = data["colors"]
-    use_diffusers = data["use_diffusers"]
-
-    if use_diffusers:
-        if pipe is None:
-            return jsonify({"error": "Diffusers model not loaded"}), 500
-        prompt = f"A {style} logo for {company_name}, {colors}, {company_focus}"
-        base64_img = generate_logo_with_diffusers(prompt)
-        if base64_img:
-            return jsonify({"image_base64": base64_img})
-        else:
-            return jsonify({"error": "Diffusers logo generation failed."}), 500
-    else:
-        logo_urls = generate_logos_from_api(company_name, style, colors, company_focus)
-        return jsonify({"logo_urls": logo_urls})
-
-# --- Streamlit Frontend (Embedded) ---
-
-st.title("LogoCraft Chatbot")
-
-company_name = st.text_input("Company Name:")
-company_focus = st.text_input("Company Focus:")
-style = st.selectbox("Logo Style:", ["Modern", "Minimalist", "Abstract", "Playful"])
-colors = st.text_input("Color Preferences:")
-use_diffusers = st.checkbox("Use Diffusers (slower, better quality)")
-
-if st.button("Generate Logos"):
-    if not company_name or not company_focus or not style or not colors:
-        st.error("Please fill in all fields.")
-    else:
         try:
-            response = requests.post("http://127.0.0.1:5000/generate_logos", json={
-                "company_name": company_name,
-                "company_focus": company_focus,
-                "style": style,
-                "colors": colors,
-                "use_diffusers": use_diffusers,
-            })
-            response.raise_for_status()
-            data = response.json()
-
-            if use_diffusers:
-                if data["image_base64"]:
-                    st.image(data["image_base64"], caption="Generated Logo", use_column_width=True)
-                else:
-                    st.error(data.get("error", "Diffusers logo generation failed."))
+            # Try loading the full model
+            model_id = "runwayml/stable-diffusion-v1-5"
+            pipe = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float32  # Use float32 for CPU
+            )
+            # Check if CUDA is available and use it
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
             else:
-                for i, url in enumerate(data["logo_urls"]):
-                    st.image(url, caption=f"Logo Option {i+1}", use_column_width=True)
-
-        except requests.exceptions.RequestException as e:
-            st.error(f"Error connecting to backend: {e}")
-        except ValueError:
-            st.error("Invalid response from backend.")
+                pipe = pipe.to("cpu")
+                # Enable attention slicing for lower memory usage
+                pipe.enable_attention_slicing()
+            return pipe
         except Exception as e:
-            st.error(f"An unexpected error occurred: {e}")
+            print(f"Error loading model: {str(e)}")
+            return None
+    return pipe
 
-# --- Run Both (Streamlit and Flask) ---
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-if __name__ == "_main_":
-    import threading
-    threading.Thread(target=app.run, kwargs={'use_reloader': False}).start()
-    st.write("Flask backend started. Streamlit app running...")
+@app.route('/generate', methods=['POST'])
+def generate_logo():
+    # Get form data
+    description = request.form.get('description', '')
+    style = request.form.get('style', 'Minimalist')
+    colors = request.form.get('colors', 'Blue and Grey')
+    width = int(request.form.get('width', 512))
+    height = int(request.form.get('height', 512))
+    steps = int(request.form.get('steps', 50))
+    guidance = float(request.form.get('guidance', 7.5))
+    
+    try:
+        # Try to load the model
+        pipe = load_model()
+        
+        if pipe:
+            # Use the model to generate the image
+            enhanced_prompt = f"A professional {style.lower()} logo with {colors.lower()} colors. {description} High quality, vector style, suitable for business use."
+            
+            image = pipe(
+                enhanced_prompt,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=guidance
+            ).images[0]
+        else:
+            # Fallback to a simple generated image if model fails to load
+            image = Image.new('RGB', (width, height), color='white')
+            d = ImageDraw.Draw(image)
+            
+            # Parse the color
+            color = colors.split(' ')[0].lower()
+            if color == 'blue':
+                bg_color = (30, 144, 255)
+            elif color == 'red':
+                bg_color = (220, 20, 60)
+            elif color == 'green':
+                bg_color = (46, 139, 87)
+            elif color == 'purple':
+                bg_color = (128, 0, 128)
+            elif color == 'orange':
+                bg_color = (255, 140, 0)
+            elif color == 'black':
+                bg_color = (0, 0, 0)
+            else:
+                bg_color = (100, 100, 100)
+            
+            # Create a simple colored placeholder with text
+            d.rectangle([(0, 0), (width, height)], fill=bg_color)
+            
+            # Try to add text (if PIL supports it without additional fonts)
+            try:
+                d.text((width//4, height//3), f"{style} Logo", fill="white", font_size=40)
+                d.text((width//4, height//2), description[:30], fill="white", font_size=20)
+            except:
+                # If text with font_size parameter fails, try the basic version
+                d.text((width//4, height//3), f"{style} Logo", fill="white")
+                d.text((width//4, height//2), description[:30], fill="white")
+        
+        # Save the image
+        filename = f"logo_{uuid.uuid4().hex}.png"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        image.save(filepath)
+        
+        return jsonify({
+            'success': True,
+            'image_url': f"/static/generated/{filename}",
+            'prompt': enhanced_prompt if pipe else f"Simple {style} logo with {colors} colors"
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"ERROR: {error_details}")  # Print to server console
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'details': error_details
+        })
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    return send_file(os.path.join(app.config['UPLOAD_FOLDER'], filename), as_attachment=True)
+
+if __name__ == '__main__':
+    app.run(debug=True)
